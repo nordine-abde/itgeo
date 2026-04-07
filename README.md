@@ -1,4 +1,4 @@
-Original dataset was downloaded from [text](https://github.com/openpolis/geojson-italy/tree/master) (License CC-BY-4.0)
+Original dataset was downloaded from [geojson-italy](https://github.com/openpolis/geojson-italy) (License CC-BY-4.0)
 
 ## Create smaller subsets
 
