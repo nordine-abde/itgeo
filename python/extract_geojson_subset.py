@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Usage examples:
 #   python3 python/extract_geojson_subset.py municipalities --limit 25
+#   python3 python/extract_geojson_subset.py municipalities --limit 25 --format formatted
 #   python3 python/extract_geojson_subset.py municipalities --limit 25 --output-file sample.geojson
 #   python3 python/extract_geojson_subset.py municipalities --region Lazio --limit 10 --sample-mode first
 #   python3 python/extract_geojson_subset.py provinces --province MI --limit 5
@@ -97,6 +98,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["first", "random"],
         default="random",
         help="Pick the first N or a deterministic random sample after filtering. Default: random.",
+    )
+    parser.add_argument(
+        "--format",
+        choices=["compact", "formatted"],
+        default="compact",
+        help="Write compact or formatted JSON output. Default: compact.",
     )
     return parser
 
@@ -253,7 +260,11 @@ def main() -> int:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as file:
-        json.dump(subset, file, ensure_ascii=False, separators=(",", ":"))
+        if args.format == "formatted":
+            json.dump(subset, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+        else:
+            json.dump(subset, file, ensure_ascii=False, separators=(",", ":"))
 
     print(f"Source: {source_path}")
     print(f"Matched features: {len(filtered)}")
