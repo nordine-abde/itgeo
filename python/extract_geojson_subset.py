@@ -18,7 +18,7 @@ from typing import Any
 DEFAULT_INPUTS = {
     "regions": Path("original-datasets/limits_IT_regions.geojson"),
     "provinces": Path("original-datasets/limits_IT_provinces.geojson"),
-    "municipalities": Path("original-datasets/limits_IT_municipalities (1).geojson"),
+    "municipalities": Path("original-datasets/limits_IT_municipalities.geojson"),
 }
 OUTPUT_DIR = Path("generated-datasets")
 
