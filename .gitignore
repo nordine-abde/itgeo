@@ -1,3 +1,5 @@
 generated-datasets/
 .idea/
 .codex
+.venv/
+__pycache__/
