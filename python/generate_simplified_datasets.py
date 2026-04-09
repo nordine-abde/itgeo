@@ -4,17 +4,27 @@
 #   python3 python/generate_simplified_datasets.py municipalities --format formatted
 #   python3 python/generate_simplified_datasets.py provinces --tolerance-meters 750
 #   python3 python/generate_simplified_datasets.py municipalities --minimum-part-area-sqm 500000
+#   python3 python/generate_simplified_datasets.py regions --coverage-policy covers-original
+#   python3 python/generate_simplified_datasets.py provinces --output-file provinces-cover.geojson
 #
 # Parameter guide:
 #   dataset
 #       all | regions | provinces | municipalities
 #       Chooses which source GeoJSON file(s) to process.
+#   --coverage-policy
+#       free | covers-original
+#       free keeps the current aggressive simplification flow.
+#       covers-original forces the final polygon to cover the full source geometry.
+#   -o, --output-file
+#       File name written inside generated-datasets/.
+#       Accepted only for single-dataset runs.
 #   --tolerance-meters
 #       Douglas-Peucker tolerance in meters.
 #       Higher values remove more vertices and simplify more aggressively.
 #   --minimum-part-area-sqm
 #       Minimum polygon-part area kept from a MultiPolygon before bridging.
-#       Smaller detached parts under this threshold are ignored.
+#       Smaller detached parts under this threshold are ignored in free mode.
+#       covers-original mode always keeps all parts.
 #   --bridge-width-meters
 #       Width in meters of the artificial corridors used to connect disjoint parts.
 #   --fallback-multipliers
@@ -50,9 +60,14 @@ DEFAULT_INPUTS = {
     "provinces": Path("original-datasets/limits_IT_provinces.geojson"),
     "municipalities": Path("original-datasets/limits_IT_municipalities.geojson"),
 }
-OUTPUT_DIR = Path("simplified-datasets")
+OUTPUT_DIR = Path("generated-datasets")
 SOURCE_CRS = "EPSG:4326"
 PROJECTED_CRS = "EPSG:3035"
+DEFAULT_COVERAGE_POLICY = "free"
+DEFAULT_OUTPUT_SUFFIXES = {
+    "free": "simplified",
+    "covers-original": "covers-original",
+}
 DEFAULT_TOLERANCE_METERS = 1_000.0
 DEFAULT_MIN_PART_AREA_SQM = 250_000.0
 DEFAULT_BRIDGE_WIDTH_METERS = 250.0
@@ -61,6 +76,11 @@ DEFAULT_FALLBACK_MULTIPLIERS_RAW = ",".join(
     f"{value:g}" for value in DEFAULT_FALLBACK_MULTIPLIERS
 )
 AREA_EPSILON_SQM = 1e-6
+OUTER_COVER_BINARY_SEARCH_STEPS = 12
+OUTER_COVER_SERIALIZATION_PASSES = 8
+OUTER_COVER_BUFFER_QUAD_SEGS = 1
+OUTER_COVER_BUFFER_JOIN_STYLE = 2
+OUTER_COVER_SERIALIZATION_MARGIN_METERS = 0.001
 
 
 TO_METRIC = Transformer.from_crs(
@@ -84,6 +104,8 @@ class DatasetStats:
     simplification_attempts: int = 0
     simplification_retries: int = 0
     simplification_base_fallbacks: int = 0
+    coverage_expansions: int = 0
+    max_outward_expansion_meters: float = 0.0
 
 
 class DisjointSet:
@@ -125,6 +147,25 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
         choices=["all", *sorted(DEFAULT_INPUTS.keys())],
         help="Dataset to process. Default: all.",
+    )
+    parser.add_argument(
+        "--coverage-policy",
+        choices=list(DEFAULT_OUTPUT_SUFFIXES.keys()),
+        default=DEFAULT_COVERAGE_POLICY,
+        help=(
+            "free keeps the current aggressive simplification flow. "
+            "covers-original expands the simplified polygon until it covers the "
+            "full source geometry. "
+            f"Default: {DEFAULT_COVERAGE_POLICY}."
+        ),
+    )
+    parser.add_argument(
+        "-o",
+        "--output-file",
+        help=(
+            "Output file name inside generated-datasets/. "
+            "Accepted only when processing a single dataset."
+        ),
     )
     parser.add_argument(
         "--tolerance-meters",
@@ -200,6 +241,8 @@ def validate_cli_args(args: argparse.Namespace) -> tuple[float, ...]:
         raise ValueError("--minimum-part-area-sqm must be greater than or equal to 0")
     if args.bridge_width_meters <= 0:
         raise ValueError("--bridge-width-meters must be greater than 0")
+    if args.dataset == "all" and args.output_file:
+        raise ValueError("--output-file can be used only when processing a single dataset")
     return parse_fallback_multipliers(args.fallback_multipliers)
 
 
@@ -370,10 +413,131 @@ def is_valid_serialized_polygon(geometry: Any) -> bool:
     )
 
 
+def serialize_metric_polygon(geometry_metric: Polygon) -> Polygon | None:
+    serialized = normalize_polygonal_geometry(to_source(geometry_metric))
+    if not isinstance(serialized, Polygon):
+        return None
+    if not is_valid_serialized_polygon(serialized):
+        return None
+    return serialized
+
+
+def roundtrip_source_polygon_to_metric(geometry_source: Polygon) -> Polygon | None:
+    roundtrip_metric = normalize_polygonal_geometry(to_metric(geometry_source))
+    if not isinstance(roundtrip_metric, Polygon):
+        return None
+    if not is_valid_output_polygon(roundtrip_metric):
+        return None
+    return roundtrip_metric
+
+
+def candidate_covers_target(
+    candidate: Polygon,
+    coverage_target: Polygon | MultiPolygon,
+) -> bool:
+    return candidate.covers(coverage_target)
+
+
+def enforce_outer_cover(
+    candidate: Polygon,
+    base_polygon: Polygon,
+    coverage_target: Polygon | MultiPolygon,
+) -> tuple[Polygon | None, float]:
+    def expand_candidate(distance: float) -> Polygon:
+        return candidate.buffer(
+            distance,
+            quad_segs=OUTER_COVER_BUFFER_QUAD_SEGS,
+            join_style=OUTER_COVER_BUFFER_JOIN_STYLE,
+        )
+
+    if candidate_covers_target(candidate, coverage_target):
+        return candidate, 0.0
+
+    upper_bound = max(candidate.hausdorff_distance(base_polygon) + 1e-6, 1e-6)
+    expanded_candidate = expand_candidate(upper_bound)
+    if not (
+        is_valid_output_polygon(expanded_candidate)
+        and candidate_covers_target(expanded_candidate, coverage_target)
+    ):
+        bounds = base_polygon.bounds
+        max_dimension = max(bounds[2] - bounds[0], bounds[3] - bounds[1], 1.0)
+        while upper_bound <= max_dimension * 4:
+            upper_bound *= 2.0
+            expanded_candidate = expand_candidate(upper_bound)
+            if (
+                is_valid_output_polygon(expanded_candidate)
+                and candidate_covers_target(expanded_candidate, coverage_target)
+            ):
+                break
+        else:
+            return None, 0.0
+
+    lower_bound = 0.0
+    best = expanded_candidate
+    for _ in range(OUTER_COVER_BINARY_SEARCH_STEPS):
+        midpoint = (lower_bound + upper_bound) / 2.0
+        trial = expand_candidate(midpoint)
+        if is_valid_output_polygon(trial) and candidate_covers_target(
+            trial,
+            coverage_target,
+        ):
+            upper_bound = midpoint
+            best = trial
+        else:
+            lower_bound = midpoint
+
+    if not is_valid_output_polygon(best):
+        return None, 0.0
+    return best, upper_bound
+
+
+def serialize_covering_metric_polygon(
+    geometry_metric: Polygon,
+    coverage_target: Polygon | MultiPolygon,
+) -> tuple[Polygon | None, float]:
+    serialization_margin = 0.0
+
+    for _ in range(OUTER_COVER_SERIALIZATION_PASSES):
+        current_metric = geometry_metric
+        if serialization_margin > 0:
+            current_metric = geometry_metric.buffer(
+                serialization_margin,
+                quad_segs=OUTER_COVER_BUFFER_QUAD_SEGS,
+                join_style=OUTER_COVER_BUFFER_JOIN_STYLE,
+            )
+
+        serialized = serialize_metric_polygon(current_metric)
+        if serialized is None:
+            serialization_margin = max(
+                OUTER_COVER_SERIALIZATION_MARGIN_METERS,
+                serialization_margin * 2.0,
+            )
+            continue
+
+        roundtrip_metric = roundtrip_source_polygon_to_metric(serialized)
+        if roundtrip_metric is None:
+            serialization_margin = max(
+                OUTER_COVER_SERIALIZATION_MARGIN_METERS,
+                serialization_margin * 2.0,
+            )
+            continue
+        if candidate_covers_target(roundtrip_metric, coverage_target):
+            return serialized, serialization_margin
+
+        serialization_margin = max(
+            OUTER_COVER_SERIALIZATION_MARGIN_METERS,
+            serialization_margin * 2.0,
+        )
+
+    return None, 0.0
+
+
 def simplify_polygon_with_fallback(
     base_polygon: Polygon,
+    coverage_target: Polygon | MultiPolygon,
     tolerance_meters: float,
     fallback_multipliers: Iterable[float],
+    coverage_policy: str,
     stats: DatasetStats,
 ) -> Polygon:
     for attempt_index, multiplier in enumerate(fallback_multipliers):
@@ -388,13 +552,60 @@ def simplify_polygon_with_fallback(
         if not is_valid_output_polygon(simplified):
             continue
 
-        simplified_source = normalize_polygonal_geometry(to_source(simplified))
-        if is_valid_serialized_polygon(simplified_source):
+        final_metric = simplified
+        expansion_distance = 0.0
+        if coverage_policy == "covers-original":
+            final_metric, expansion_distance = enforce_outer_cover(
+                candidate=simplified,
+                base_polygon=base_polygon,
+                coverage_target=coverage_target,
+            )
+            if final_metric is None:
+                continue
+            simplified_source, roundtrip_expansion_distance = (
+                serialize_covering_metric_polygon(
+                    geometry_metric=final_metric,
+                    coverage_target=coverage_target,
+                )
+            )
+            if simplified_source is None:
+                continue
+            total_expansion_distance = expansion_distance + roundtrip_expansion_distance
+            if total_expansion_distance > 0:
+                stats.coverage_expansions += 1
+                stats.max_outward_expansion_meters = max(
+                    stats.max_outward_expansion_meters,
+                    total_expansion_distance,
+                )
+            return simplified_source
+
+        simplified_source = serialize_metric_polygon(final_metric)
+        if simplified_source is not None:
             return simplified_source
 
     stats.simplification_base_fallbacks += 1
-    fallback_source = normalize_polygonal_geometry(to_source(base_polygon))
-    if not is_valid_serialized_polygon(fallback_source):
+    if coverage_policy == "covers-original" and not candidate_covers_target(
+        base_polygon,
+        coverage_target,
+    ):
+        raise ValueError("Base polygon does not cover the full source geometry")
+    if coverage_policy == "covers-original":
+        fallback_source, roundtrip_expansion_distance = serialize_covering_metric_polygon(
+            geometry_metric=base_polygon,
+            coverage_target=coverage_target,
+        )
+        if fallback_source is None:
+            raise ValueError("Base polygon did not produce a valid serialized Polygon")
+        if roundtrip_expansion_distance > 0:
+            stats.coverage_expansions += 1
+            stats.max_outward_expansion_meters = max(
+                stats.max_outward_expansion_meters,
+                roundtrip_expansion_distance,
+            )
+        return fallback_source
+
+    fallback_source = serialize_metric_polygon(base_polygon)
+    if fallback_source is None:
         raise ValueError("Base polygon did not produce a valid serialized Polygon")
     return fallback_source
 
@@ -410,6 +621,7 @@ def transform_feature(
     bridge_width_meters: float,
     tolerance_meters: float,
     fallback_multipliers: Iterable[float],
+    coverage_policy: str,
     stats: DatasetStats,
 ) -> dict[str, Any]:
     properties = feature.get("properties")
@@ -426,28 +638,46 @@ def transform_feature(
             "Feature geometry must be Polygon or MultiPolygon, "
             f"got `{geometry_data.get('type')}`"
         )
+    normalized_original = normalize_polygonal_geometry(original_geometry)
 
     stats.features_processed += 1
     if isinstance(original_geometry, MultiPolygon):
         stats.multipart_features += 1
 
     bbox = build_bbox(original_geometry)
-    geometry_metric = to_metric(original_geometry)
+    coverage_target_metric = normalize_polygonal_geometry(to_metric(normalized_original))
+    effective_min_part_area = (
+        0.0 if coverage_policy == "covers-original" else min_part_area_sqm
+    )
     base_polygon, removed_parts, bridge_count = build_base_polygon(
-        geometry_metric,
-        min_part_area_sqm=min_part_area_sqm,
+        coverage_target_metric,
+        min_part_area_sqm=effective_min_part_area,
         bridge_width_meters=bridge_width_meters,
     )
     if not is_valid_output_polygon(base_polygon):
         raise ValueError("Base polygon is invalid or degenerate before simplification")
+    if coverage_policy == "covers-original" and not candidate_covers_target(
+        base_polygon,
+        coverage_target_metric,
+    ):
+        expanded_base_polygon, _ = enforce_outer_cover(
+            candidate=base_polygon,
+            base_polygon=base_polygon,
+            coverage_target=coverage_target_metric,
+        )
+        if expanded_base_polygon is None:
+            raise ValueError("Base polygon does not cover the full normalized source geometry")
+        base_polygon = expanded_base_polygon
 
     stats.parts_removed_by_area += removed_parts
     stats.bridges_added += bridge_count
 
     simplified_source = simplify_polygon_with_fallback(
         base_polygon,
+        coverage_target=coverage_target_metric,
         tolerance_meters=tolerance_meters,
         fallback_multipliers=fallback_multipliers,
+        coverage_policy=coverage_policy,
         stats=stats,
     )
     if not is_valid_serialized_polygon(simplified_source):
@@ -461,8 +691,24 @@ def transform_feature(
     }
 
 
-def output_path_for_dataset(dataset: str) -> Path:
-    return OUTPUT_DIR / f"limits_IT_{dataset}.simplified.geojson"
+def default_output_path(dataset: str, coverage_policy: str) -> Path:
+    suffix = DEFAULT_OUTPUT_SUFFIXES[coverage_policy]
+    return OUTPUT_DIR / f"limits_IT_{dataset}.{suffix}.geojson"
+
+
+def resolve_output_path(
+    dataset: str,
+    coverage_policy: str,
+    output_file: str | None,
+) -> Path:
+    if not output_file:
+        return default_output_path(dataset, coverage_policy)
+
+    file_name = Path(output_file).name
+    if file_name in {"", ".", ".."}:
+        raise ValueError("--output-file must be a valid file name")
+
+    return OUTPUT_DIR / file_name
 
 
 def resolve_dataset_targets(dataset: str) -> list[str]:
@@ -488,6 +734,8 @@ def write_feature_collection(
 
 def process_dataset(
     dataset: str,
+    output_path: Path,
+    coverage_policy: str,
     tolerance_meters: float,
     min_part_area_sqm: float,
     bridge_width_meters: float,
@@ -495,7 +743,6 @@ def process_dataset(
     json_format: str,
 ) -> DatasetStats:
     input_path = DEFAULT_INPUTS[dataset]
-    output_path = output_path_for_dataset(dataset)
 
     data = load_feature_collection(input_path)
     transformed_features = []
@@ -509,6 +756,7 @@ def process_dataset(
                 bridge_width_meters=bridge_width_meters,
                 tolerance_meters=tolerance_meters,
                 fallback_multipliers=fallback_multipliers,
+                coverage_policy=coverage_policy,
                 stats=stats,
             )
         )
@@ -524,17 +772,36 @@ def process_dataset(
     return stats
 
 
-def print_summary(dataset: str, stats: DatasetStats) -> None:
-    print(
-        (
-            f"{dataset}: features={stats.features_processed}, "
-            f"multipart={stats.multipart_features}, "
-            f"parts_removed={stats.parts_removed_by_area}, "
-            f"bridges_added={stats.bridges_added}, "
-            f"simplify_attempts={stats.simplification_attempts}, "
-            f"simplify_retries={stats.simplification_retries}, "
-            f"base_fallbacks={stats.simplification_base_fallbacks}"
+def print_summary(
+    dataset: str,
+    coverage_policy: str,
+    output_path: Path,
+    stats: DatasetStats,
+) -> None:
+    summary_parts = [
+        f"dataset={dataset}",
+        f"policy={coverage_policy}",
+        f"features={stats.features_processed}",
+        f"multipart={stats.multipart_features}",
+        f"parts_removed={stats.parts_removed_by_area}",
+        f"bridges_added={stats.bridges_added}",
+        f"simplify_attempts={stats.simplification_attempts}",
+        f"simplify_retries={stats.simplification_retries}",
+        f"base_fallbacks={stats.simplification_base_fallbacks}",
+    ]
+    if coverage_policy == "covers-original":
+        summary_parts.extend(
+            [
+                f"cover_expansions={stats.coverage_expansions}",
+                (
+                    "max_outward_expansion_meters="
+                    f"{stats.max_outward_expansion_meters:.6f}"
+                ),
+            ]
         )
+
+    print(
+        ", ".join(summary_parts) + f", output={output_path}"
     )
 
 
@@ -548,15 +815,27 @@ def main() -> int:
         parser.error(str(exc))
 
     for dataset in resolve_dataset_targets(args.dataset):
+        output_path = resolve_output_path(
+            dataset=dataset,
+            coverage_policy=args.coverage_policy,
+            output_file=args.output_file,
+        )
         stats = process_dataset(
             dataset=dataset,
+            output_path=output_path,
+            coverage_policy=args.coverage_policy,
             tolerance_meters=args.tolerance_meters,
             min_part_area_sqm=args.minimum_part_area_sqm,
             bridge_width_meters=args.bridge_width_meters,
             fallback_multipliers=fallback_multipliers,
             json_format=args.format,
         )
-        print_summary(dataset, stats)
+        print_summary(
+            dataset=dataset,
+            coverage_policy=args.coverage_policy,
+            output_path=output_path,
+            stats=stats,
+        )
 
     return 0
 
