@@ -3,3 +3,5 @@ generated-datasets/
 .codex
 .venv/
 __pycache__/
+*.osm.pbf
+*.osm.pbf.tmp

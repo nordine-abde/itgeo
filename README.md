@@ -1,4 +1,6 @@
-Original dataset was downloaded from [geojson-italy](https://github.com/openpolis/geojson-italy) (License CC-BY-4.0)
+Original boundary datasets were downloaded from [geojson-italy](https://github.com/openpolis/geojson-italy) (License CC-BY-4.0).
+
+Optional administrative centre data can be generated from [OpenStreetMap](https://www.openstreetmap.org/) data, for example using the [Geofabrik Italy extract](https://download.geofabrik.de/europe/italy.html). OpenStreetMap data is available under the [Open Database License](https://www.openstreetmap.org/copyright). If this derived dataset is used or redistributed, keep OpenStreetMap attribution visible and preserve the ODbL obligations that apply to the generated database.
 
 ## Python setup
 
@@ -14,6 +16,28 @@ Install the project dependencies:
 ```bash
 python3 -m pip install -r requirements.txt
 ```
+
+## Extract OSM administrative centres
+
+Use this helper to generate a separate admin-centre point dataset from an Italy OSM PBF extract:
+
+```bash
+python3 python/extract_osm_admin_centers.py --download
+```
+
+The default download source is the Geofabrik Italy extract, written locally as `original-datasets/italy-latest.osm.pbf`. The `.osm.pbf` extract is intentionally ignored by git because it is large and can be downloaded again.
+
+If you already downloaded the extract manually:
+
+```bash
+python3 python/extract_osm_admin_centers.py --osm-pbf original-datasets/italy-latest.osm.pbf
+```
+
+The generated file is:
+
+- `original-datasets/osm_IT_admin_centers.geojson`
+
+The script reads OSM administrative boundary relations for Italian regions, provinces, and municipalities (`admin_level` 4, 6, and 8), extracts the `admin_centre` relation member when present, and stores the admin-centre point as the feature geometry. OSM `label` members are kept only as separate properties. This dataset is intentionally separate from future geometric-centre or centroid datasets.
 
 ## Create smaller subsets
 
@@ -125,4 +149,27 @@ Choose a custom output file name for a single-dataset run:
 
 ```bash
 python3 python/generate_simplified_datasets.py provinces --coverage-policy covers-original --output-file provinces-cover.geojson
+```
+
+## Generate PostgreSQL inserts
+
+Use the SQL exporter to generate PostGIS insert statements for the single-table database structure:
+
+```bash
+python3 python/generate_postgres_inserts.py all
+```
+
+The default output file is:
+
+- `generated-datasets/italian_administrative_area_inserts.sql`
+
+The exporter reuses `python/generate_simplified_datasets.py` for simplified geometry generation. That simplifier intentionally emits `Polygon` geometry, including when the source is a `MultiPolygon`; the SQL exporter wraps original geometry with `ST_Multi(...)` and stores simplified geometry as `GEOMETRY(Polygon, 4326)`.
+
+Useful examples:
+
+```bash
+python3 python/generate_postgres_inserts.py regions
+python3 python/generate_postgres_inserts.py provinces --coverage-policy covers-original
+python3 python/generate_postgres_inserts.py municipalities --output-file generated-datasets/municipality-inserts.sql
+python3 python/generate_postgres_inserts.py all --limit 5 --output-file generated-datasets/sample-inserts.sql
 ```
