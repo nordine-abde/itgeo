@@ -173,3 +173,56 @@ python3 python/generate_postgres_inserts.py provinces --coverage-policy covers-o
 python3 python/generate_postgres_inserts.py municipalities --output-file generated-datasets/municipality-inserts.sql
 python3 python/generate_postgres_inserts.py all --limit 5 --output-file generated-datasets/sample-inserts.sql
 ```
+
+## Dataset light senza geometrie
+
+Il dataset light contiene regioni, province e comuni italiani in formato JSONL,
+una riga per area amministrativa. Non contiene geometrie e non richiede PostGIS:
+espone identificativi naturali, codici amministrativi, bbox e coordinate del
+centro amministrativo quando disponibili.
+
+Generazione completa:
+
+```bash
+python3 python/generate_light_dataset.py all
+```
+
+Output predefinito tracciato dal repository:
+
+- `datasets/italian_administrative_areas_light.jsonl`
+
+Esempi utili:
+
+```bash
+python3 python/generate_light_dataset.py regions
+python3 python/generate_light_dataset.py all --limit 5 --output-file generated-datasets/light-sample.jsonl
+python3 python/generate_light_dataset.py all --no-admin-centers
+```
+
+Ogni record include:
+
+- `id` stabile con prefisso di tipo amministrativo, ad esempio `region:03`,
+  `province:015` o `municipality:015146`
+- `type`: `region`, `province` o `municipality`
+- `name` e `searchName`
+- `regionName`, `regionIstatCode`, `regionIstatCodeNum`
+- `provinceName`, `provinceIstatCode`, `provinceIstatCodeNum`,
+  `provinceAcronym`
+- `municipalityIstatCode`, `municipalityIstatCodeNum`, `cadastralCode`
+- `parentRegionIstatCode` e `parentProvinceIstatCode`
+- `centerLat` e `centerLng`, valorizzati solo quando il centro amministrativo
+  OSM e' disponibile
+- `bbox` nel formato `[minLng,minLat,maxLng,maxLat]`, oppure `null` se non
+  disponibile
+- `sourceDataset` e `source`: dataset sorgente e licenze usate per confini e
+  centri amministrativi
+
+Attribuzioni e licenze:
+
+- I confini amministrativi derivano da `original-datasets/limits_IT_*.geojson`,
+  scaricati da `openpolis/geojson-italy`, licenza `CC-BY-4.0`.
+- I centri amministrativi opzionali derivano da OpenStreetMap tramite
+  `original-datasets/osm_IT_admin_centers.geojson`, licenza `ODbL-1.0`.
+- Se il dataset light viene ridistribuito con i centri amministrativi OSM,
+  mantenere l'attribuzione OpenStreetMap visibile e rispettare gli obblighi
+  ODbL applicabili al database derivato.
