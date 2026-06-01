@@ -215,7 +215,8 @@ Ogni record include:
 - `bbox` nel formato `[minLng,minLat,maxLng,maxLat]`, oppure `null` se non
   disponibile
 - `sourceDataset` e `source`: dataset sorgente e licenze usate per confini e
-  centri amministrativi
+  centri amministrativi; `source.repository` e `source.commit` tracciano il
+  repository Git e il commit corrente usati durante la generazione
 
 Attribuzioni e licenze:
 

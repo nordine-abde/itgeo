@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import subprocess
 import sys
 import unicodedata
 from dataclasses import dataclass
@@ -213,10 +214,44 @@ def center_rank(properties: dict[str, Any]) -> tuple[int, int]:
     )
 
 
+def git_output(args: list[str], required: bool) -> str | None:
+    repo_dir = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo_dir,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    value = result.stdout.strip()
+    if result.returncode == 0 and value:
+        return value
+    if required:
+        command = " ".join(["git", *args])
+        raise ValueError(f"Could not read Git metadata with `{command}`")
+    return None
+
+
+def repository_metadata() -> dict[str, str]:
+    repository = (
+        git_output(["config", "--get", "remote.origin.url"], required=False)
+        or git_output(["rev-parse", "--show-toplevel"], required=True)
+    )
+    commit = git_output(["rev-parse", "HEAD"], required=True)
+    if repository is None or commit is None:
+        raise ValueError("Could not read complete Git repository metadata")
+    return {
+        "repository": repository,
+        "commit": commit,
+    }
+
+
 def source_metadata(
     source_path: Path,
     center: dict[str, Any] | None,
     admin_centers_file: Path,
+    repository: dict[str, str],
 ) -> dict[str, Any]:
     admin_center = None
     if center is not None:
@@ -229,6 +264,7 @@ def source_metadata(
         }
 
     return {
+        **repository,
         "boundary": {
             "dataset": str(source_path),
             **BOUNDARY_SOURCE,
@@ -241,6 +277,7 @@ def light_record(
     feature: SourceFeature,
     center: dict[str, Any] | None,
     admin_centers_file: Path,
+    repository: dict[str, str],
 ) -> dict[str, Any]:
     admin_type = feature.admin_type
     properties = feature.properties
@@ -278,6 +315,7 @@ def light_record(
             source_path=feature.source_path,
             center=center,
             admin_centers_file=admin_centers_file,
+            repository=repository,
         ),
     }
 
@@ -308,6 +346,7 @@ def write_jsonl(args: argparse.Namespace) -> None:
         if args.no_admin_centers
         else load_admin_centers(args.admin_centers_file)
     )
+    repository = repository_metadata()
 
     args.output_file.parent.mkdir(parents=True, exist_ok=True)
     matched_centers = 0
@@ -324,6 +363,7 @@ def write_jsonl(args: argparse.Namespace) -> None:
                 feature=feature,
                 center=center,
                 admin_centers_file=args.admin_centers_file,
+                repository=repository,
             )
             file.write(
                 json.dumps(record, ensure_ascii=False, separators=(",", ":"))
